@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtualenvs
+.venv/
+venv/
+
+# macOS & editors
+.DS_Store
+.vscode/
+
+# Secrets (never commit tokens)
+.env
+*.env
+secrets*.json
