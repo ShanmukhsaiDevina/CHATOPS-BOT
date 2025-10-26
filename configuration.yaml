@@ -1,0 +1,9 @@
+welcome-message: true
+
+connectors:
+  websocket:
+    type: websocket
+
+skills:
+  ci:
+    path: /home/opsdroid/.config/opsdroid/skills/ci
