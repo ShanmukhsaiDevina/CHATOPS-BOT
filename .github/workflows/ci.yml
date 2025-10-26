@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulate a failing step
+        run: |
+          echo "This step fails on purpose for testing /logs"
+          exit 1
