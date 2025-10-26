@@ -7,3 +7,7 @@ connectors:
 skills:
   ci:
     path: /home/opsdroid/.config/opsdroid/skills/ci
+  logs:
+    path: /home/opsdroid/.config/opsdroid/skills/logs
+  explain:
+    path: /home/opsdroid/.config/opsdroid/skills/explain
