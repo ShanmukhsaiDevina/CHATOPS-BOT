@@ -14,7 +14,8 @@ def _req(url, token, as_bytes=False):
         return r.read() if as_bytes else json.loads(r.read().decode("utf-8"))
 
 class LogSkill(Skill):
-    @match_regex(r"^/?logs?$", case_sensitive=False)
+    # Accept: "log", "logs", or "logs 3"
+    @match_regex(r"^/?logs?(?:\s+(\d+))?$", case_sensitive=False)
     async def logs(self, message):
         token = os.environ.get("GITHUB_TOKEN", "").strip()
         owner = os.environ.get("GH_OWNER", "").strip()
@@ -27,34 +28,50 @@ class LogSkill(Skill):
             await message.respond("❌ Missing GH_OWNER / GH_REPO.")
             return
 
-        # Build clean, encoded URLs (no spaces/newlines)
         owner_q = quote(owner, safe="")
         repo_q  = quote(repo,  safe="")
-        runs_url = f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs?status=failure&per_page=5"
 
-        await message.respond("🔎 Searching latest *failed* GitHub Actions run…")
+        # If user typed a number, use list mode
+        count = 1
+        if message.regex and message.regex.group(1):
+            count = max(1, min(10, int(message.regex.group(1))))  # 1..10
 
+        runs_url = f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs?status=failure&per_page={count}"
         try:
             data = _req(runs_url, token)
             runs = data.get("workflow_runs", [])
+
             if not runs:
                 await message.respond("✅ No failed runs found recently.")
                 return
 
-            run = runs[0]
-            await message.respond(f"📦 Failed run: {run['html_url']}")
+            # If only 1 requested: show the tail like before
+            if count == 1:
+                run = runs[0]
+                await message.respond(f"📦 Failed run: {run['html_url']}")
 
-            logs_url = f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs/{run['id']}/logs"
-            zip_bytes = _req(logs_url, token, as_bytes=True)
+                logs_url = f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs/{run['id']}/logs"
+                zip_bytes = _req(logs_url, token, as_bytes=True)
 
-            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                files = sorted(zf.infolist(), key=lambda i: i.file_size, reverse=True)
-                if not files:
-                    await message.respond("⚠️ Log archive is empty.")
-                    return
-                text = zf.read(files[0]).decode("utf-8", errors="replace")
-                tail = "\n".join(text.splitlines()[-30:])
-                await message.respond(f"🧾 Last 30 lines:\n```{tail}```")
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                    files = sorted(zf.infolist(), key=lambda i: i.file_size, reverse=True)
+                    if not files:
+                        await message.respond("⚠️ Log archive is empty.")
+                        return
+                    content = zf.read(files[0]).decode("utf-8", errors="replace")
+                    tail = "\n".join(content.splitlines()[-30:])
+                    await message.respond(f"🧾 Last 30 lines:\n```{tail}```")
+                return
 
+            # Else: list mode for N runs
+            lines = []
+            for i, r in enumerate(runs, 1):
+                when = (r.get("created_at") or "")[:19].replace("T", " ")
+                lines.append(f"{i}. {when} • run_id={r['id']}\n{r['html_url']}")
+            await message.respond("🧾 Recent failed runs:\n" + "\n\n".join(lines))
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            await message.respond(f"❌ HTTP {e.code} while fetching runs/logs:\n```{body[:600]}```")
         except Exception as e:
-            await message.respond(f"❌ Error:\n```{str(e)[:1200]}```")
+            await message.respond(f"❌ Error:\n```{str(e)[:1000]}```")
