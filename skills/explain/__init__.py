@@ -1,4 +1,4 @@
-import os, io, zipfile, json, re, urllib.request
+import os, io, zipfile, json, re, urllib.request, urllib.error
 from urllib.parse import quote
 from opsdroid.skill import Skill
 from opsdroid.matchers import match_regex
@@ -13,62 +13,48 @@ def _req(url, token, as_bytes=False):
     with urllib.request.urlopen(req, timeout=60) as r:
         return r.read() if as_bytes else json.loads(r.read().decode("utf-8"))
 
-def _detect(findings: str):
-    """Return (title, advice) based on simple patterns."""
-    text = findings
-
+def _detect(text: str):
     rules = [
-        (r"Traceback \(most recent call last\)", 
-         "Python exception",
-         "A Python stack trace was detected. Check the last exception line for the exact error type and file. "
-         "Common fixes: import the missing module, correct the path, or handle None values."),
-        (r"ModuleNotFoundError: ([\w\.\-]+)", 
-         "Python module not found",
-         "Install the missing dependency (e.g., `pip install {0}`) or add it to your requirements."),
-        (r"pytest (?:FAILURES|ERRORS)",
-         "Pytest failures",
-         "Unit tests failed. Open the failing test names shown above. Re-run locally with `pytest -q` to reproduce."),
-        (r"AssertionError(:.*)?",
-         "AssertionError in tests",
-         "An assertion failed in tests. Compare expected vs actual values printed nearby."),
-        (r"npm ERR! (?P<err>.*)",
-         "npm error",
-         "A Node.js/npm command failed. Read the first npm ERR! lines for the root cause; try `npm ci` to reset deps."),
-        (r"command not found: ([\w\-\_\.]+)",
-         "Command not found",
-         "The CI runner couldn’t find this command. Install it first or add the tool to PATH."),
-        (r"No such file or directory: ['\"]?([^'\"]+)['\"]?",
-         "Missing file/path",
-         "A file path is missing. Verify the path and ensure the file is checked out or generated earlier."),
-        (r"Permission denied",
-         "Permission denied",
-         "File/command lacked permissions. Use `chmod +x` for scripts or adjust runner permissions."),
-        (r"exit\s+1\b",
-         "Process exited with code 1",
-         "A generic failure occurred. Look a few lines above for the specific error message."),
+        (r"Traceback \(most recent call last\)", "Python exception",
+         "A Python traceback was detected. Check the last exception line and fix the root cause (missing import/path/None)."),
+        (r"ModuleNotFoundError: ([\w\.\-]+)", "Python module not found",
+         "Install the missing package (e.g., `pip install {0}`) or add it to your requirements."),
+        (r"pytest (?:FAILURES|ERRORS)", "Pytest failures",
+         "Unit tests failed. Re-run locally with `pytest -q` and fix the failing tests."),
+        (r"AssertionError(:.*)?", "Assertion in tests",
+         "An assertion failed. Compare expected vs actual in the lines above."),
+        (r"npm ERR! (?P<err>.*)", "npm error",
+         "An npm command failed. Read the first npm ERR! lines; try `npm ci` to reset dependencies."),
+        (r"command not found: ([\w\-\_\.]+)", "Command not found",
+         "The CI runner couldn’t find this command. Install it or add it to PATH."),
+        (r"No such file or directory: ['\"]?([^'\"]+)['\"]?", "Missing file/path",
+         "A required file/path is missing. Verify the path and ensure it is checked out or generated."),
+        (r"Permission denied", "Permission denied",
+         "A file/command lacked permissions. Use `chmod +x` for scripts or adjust permissions."),
+        (r"exit\s+1\b", "Process exited with code 1",
+         "Generic failure. Look a few lines above for the real error."),
     ]
-
-    for pattern, title, advice in rules:
-        m = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+    for pat, title, advice in rules:
+        m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
         if m:
-            # Include captured value if available
             captured = ""
             if m.groups():
-                # Try first non-empty capture for personalization
                 for g in m.groups():
                     if g:
                         captured = str(g).strip(": ").strip()
                         break
-            hint = advice
             if "{0}" in advice and captured:
-                hint = advice.format(captured)
-            return title, hint
+                advice = advice.format(captured)
+            return title, advice
     return ("Couldn’t auto-detect the exact cause",
-            "Scan the last lines above for the first clear error. "
-            "Next step: enable the LLM summary to get a concise explanation.")
+            "Scan the last lines above for the first clear error. Next: enable the LLM summary for a concise explanation.")
 
 class ExplainSkill(Skill):
-    @match_regex(r"^/?explain$", case_sensitive=False)
+    # Accept:
+    #   "explain"
+    #   "explain 2"               -> Nth recent failed run (max 10)
+    #   "explain id 18823013212"  -> specific run id
+    @match_regex(r"^/?explain(?:\s+(id)\s+(\d+)|\s+(\d+))?$", case_sensitive=False)
     async def explain(self, message):
         token = os.environ.get("GITHUB_TOKEN", "").strip()
         owner = os.environ.get("GH_OWNER", "").strip()
@@ -82,22 +68,29 @@ class ExplainSkill(Skill):
             return
 
         owner_q, repo_q = quote(owner, safe=""), quote(repo, safe="")
-        runs_url = f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs?status=failure&per_page=1"
-        await message.respond("🧠 Analyzing the latest *failed* run…")
+        m = message.regex
+        by_id = (m and m.group(1) == "id")
+        run_id = m.group(2) if m and m.group(2) else None
+        index  = int(m.group(3)) if m and m.group(3) else 1
+        index  = max(1, min(10, index))  # 1..10
 
         try:
-            runs = _req(runs_url, token).get("workflow_runs", [])
-            if not runs:
-                await message.respond("✅ No failed runs found recently.")
-                return
+            if by_id and run_id:
+                run = _req(f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs/{run_id}", token)
+            else:
+                data = _req(f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs?status=failure&per_page={index}", token)
+                runs = data.get("workflow_runs", [])
+                if len(runs) < index:
+                    await message.respond(f"⚠️ Only {len(runs)} failed runs found. Try a smaller number.")
+                    return
+                run = runs[index - 1]
 
-            run = runs[0]
             await message.respond(f"📦 Failed run: {run['html_url']}")
 
             logs_url = f"https://api.github.com/repos/{owner_q}/{repo_q}/actions/runs/{run['id']}/logs"
             zip_bytes = _req(logs_url, token, as_bytes=True)
 
-            # Read and combine the biggest few files to get good context
+            # Combine the biggest few files for context
             import heapq
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                 largest = heapq.nlargest(3, zf.infolist(), key=lambda i: i.file_size)
@@ -105,16 +98,16 @@ class ExplainSkill(Skill):
                 for f in largest:
                     combined += zf.read(f).decode("utf-8", errors="replace") + "\n"
 
-            # Look at the last ~300 lines for signal
             lines = combined.splitlines()
             window = "\n".join(lines[-300:])
-
             title, advice = _detect(window)
-            snippet = "\n".join(lines[-40:])  # small tail for reference
+            snippet = "\n".join(lines[-40:])
 
             await message.respond(f"🔎 **Detected:** {title}\n💡 **Likely fix:** {advice}")
             await message.respond(f"🧾 Context (last lines):\n```{snippet}```")
 
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            await message.respond(f"❌ HTTP {e.code} while fetching/analyzing:\n```{body[:600]}```")
         except Exception as e:
-            await message.respond("❌ Error while analyzing logs.")
-            await message.respond(f"Details:\n```{str(e)[:1000]}```")
+            await message.respond(f"❌ Error:\n```{str(e)[:1000]}```")
